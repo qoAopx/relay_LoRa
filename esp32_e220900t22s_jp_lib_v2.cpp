@@ -246,9 +246,17 @@ int CLoRa::SendFrame(struct LoRaConfigItem_t &config, uint8_t *send_data, int si
   uint8_t subpacket_size = 0;
 
   //while (!LoRa_AUXPin);
+  // ★修正：AUXがHIGH（モジュールの処理完了）に戻るまで待つ。
+  //   タイムアウトを設けて、万一AUXが機能しない配線でもフリーズしないようにする。
+  unsigned long auxWaitStart = millis();
   while (digitalRead(LoRa_AUXPin) == LOW) {
-    delay(10);  // AUXがHIGH（バッファ空）になるまで待つ
+    if (millis() - auxWaitStart > 1000) {
+      Print("AUX wait timeout in InitLoRaModule()\n");
+      break;
+    }
+    delay(2);
   }
+  delay(20);  // AUXがHIGHに戻った直後の追加安定待ち（データシート推奨）
   //  Print("\n.......... send data length = %d \n", size);
 
   switch (config.subpacket_size) {
