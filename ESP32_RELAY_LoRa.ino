@@ -38,6 +38,7 @@ const int BUZZER_PIN = 19;
 static BLEServer* pServer = nullptr;
 static BLECharacteristic* pRelayCharacteristic = nullptr;
 static volatile bool phoneConnected = false;
+static volatile uint32_t bleConnectionGeneration = 0;
 
 static CLoRa lora;
 static LoRaConfigItem_t loraConfig;
@@ -46,6 +47,11 @@ static uint32_t receivedFrames = 0;
 static uint32_t forwardedFrames = 0;
 static uint32_t droppedFrames = 0;
 static char lastLapStr[16] = "--:--.--";
+static uint32_t receiveErrors = 0;
+static uint32_t emptyFrames = 0;
+static bool lastAuxLow = false;
+static uint32_t lastReceiveAttemptMs = 0;
+static const uint32_t RECEIVE_RETRY_GUARD_MS = 2;
 static unsigned long lastLapFlashUntilMs = 0;
 const unsigned long LAP_FLASH_DURATION_MS = 800;
 const int NOTE_FREQ = 4000;              // ブザー音の高さ（Hz）：4000Hz
@@ -57,13 +63,16 @@ int64_t buzzerStartTime = 0;   // ブザーを鳴らし始めた時刻
 class PhoneServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* server) override {
     phoneConnected = true;
+    ++bleConnectionGeneration;
     Serial.println(F("[BLE] Phone connected"));
   }
 
   void onDisconnect(BLEServer* server) override {
     phoneConnected = false;
+    ++bleConnectionGeneration;
     Serial.println(F("[BLE] Phone disconnected; restarting advertising"));
-    delay(300);
+    // Do not delay inside the BLE callback. A blocking delay here can stall
+    // the BLE host task and make reconnects appear unreliable.
     BLEDevice::startAdvertising();
   }
 };
@@ -130,7 +139,9 @@ void forwardToBLE(const uint8_t* data, uint16_t length, int rssi) {
   printPayload(data, length);
   updateLapDisplay(data, length);
 
-  if (!phoneConnected) {
+  // Snapshot the connection state. The BLE callback can change it asynchronously.
+  const uint32_t connectionGeneration = bleConnectionGeneration;
+  if (!phoneConnected || pRelayCharacteristic == nullptr) {
     ++droppedFrames;
     Serial.println(F("[Relay] BLE phone is not connected; payload was not notified"));
     return;
@@ -138,6 +149,15 @@ void forwardToBLE(const uint8_t* data, uint16_t length, int rssi) {
 
   // No text conversion or framing is done here: the original BLE payload is retained.
   pRelayCharacteristic->setValue(data, length);
+
+  // If the phone disconnected while setValue() was executing, do not notify a
+  // stale connection. This does not alter the packet format.
+  if (!phoneConnected || connectionGeneration != bleConnectionGeneration) {
+    ++droppedFrames;
+    Serial.println(F("[Relay] BLE connection changed before notify; payload dropped"));
+    return;
+  }
+
   pRelayCharacteristic->notify();
   ++forwardedFrames;
   Serial.printf("[Relay] BLE notify sent: frame #%lu, %u byte(s) -> phone\n",
@@ -191,19 +211,29 @@ bool setupLoRa() {
   return true;
 }
 
-void receiveAndRelay() {
+bool receiveAndRelay() {
   RecvFrameE220900T22SJP_t frame;
+  memset(&frame, 0, sizeof(frame));
+
   Serial.println(F("[LoRa] AUX LOW: receiving frame..."));
   const int result = lora.ReceiveFrame(&frame);
+  lastReceiveAttemptMs = millis();
+
   if (result != 0) {
-    Serial.printf("[LoRa] ReceiveFrame failed (code %d)\n", result);
-    return;
+    ++receiveErrors;
+    Serial.printf("[LoRa] ReceiveFrame failed (code %d), errors=%lu\n",
+                  result, static_cast<unsigned long>(receiveErrors));
+    return false;
   }
   if (frame.recv_data_len == 0) {
-    Serial.println(F("[LoRa] Empty frame ignored"));
-    return;
+    ++emptyFrames;
+    Serial.printf("[LoRa] Empty frame ignored (empty=%lu)\n",
+                  static_cast<unsigned long>(emptyFrames));
+    return false;
   }
+
   forwardToBLE(frame.recv_data, frame.recv_data_len, frame.rssi);
+  return true;
 }
 
 void setup() {
@@ -221,21 +251,41 @@ void setup() {
 
 void loop() {
   // The E220 holds AUX LOW while radio/UART receive data is pending.
-  if (loraReady && digitalRead(LoRa_AUXPin) == LOW) {
-    receiveAndRelay();
-    //ブザーを鳴らす
-    tone(BUZZER_PIN, NOTE_FREQ);             // 時間指定なしで音を出す
-    buzzerStartTime = esp_timer_get_time();  // 鳴らし始めた時刻を記録
-    isBuzzerRinging = true;                  // ブザー鳴動中フラグをON
+  // Use the AUX level as a receive gate, but prevent the same LOW condition
+  // from immediately retriggering the buzzer after a receive error.
+  const bool auxLow = (digitalRead(LoRa_AUXPin) == LOW);
+
+  if (loraReady && auxLow) {
+    // If AUX has just gone LOW, receive immediately. If it remains LOW after
+    // ReceiveFrame(), allow the library to drain another pending frame, but
+    // avoid a tight error loop when the library returns an error.
+    const uint32_t now = millis();
+    const bool newAuxEvent = !lastAuxLow;
+    const bool retryAllowed = (now - lastReceiveAttemptMs >= RECEIVE_RETRY_GUARD_MS);
+
+    if (newAuxEvent || retryAllowed) {
+      const bool received = receiveAndRelay();
+
+      // Only a successfully received non-empty packet should produce the
+      // one-shot relay buzzer. This prevents a stuck/low AUX signal from
+      // causing continuous tone restarts.
+      if (received && !isBuzzerRinging) {
+        tone(BUZZER_PIN, NOTE_FREQ);
+        buzzerStartTime = esp_timer_get_time();
+        isBuzzerRinging = true;
+      }
+    }
   }
+
+  lastAuxLow = auxLow;
 
   // ブザーが鳴っていたら停止
   if (isBuzzerRinging) {
-    // 指定した時間（100ms）が経過したかチェック
-    unsigned long elapsedBuzzerMs = (unsigned long)((esp_timer_get_time() - buzzerStartTime) / 1000LL);
+    const uint64_t elapsedBuzzerMs =
+        (static_cast<uint64_t>(esp_timer_get_time()) - static_cast<uint64_t>(buzzerStartTime)) / 1000ULL;
     if (elapsedBuzzerMs >= TONE_DURATION) {
-      noTone(BUZZER_PIN);       // 音を止める
-      isBuzzerRinging = false;  // ブザー鳴動中フラグをOFF
+      noTone(BUZZER_PIN);
+      isBuzzerRinging = false;
     }
   }
 
